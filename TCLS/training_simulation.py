@@ -16,9 +16,11 @@ PHASE_EWL_YELLOW = 7
 
 
 class Simulation:
-    def __init__(self, Model, TrafficGen, sumo_cmd, max_steps, green_duration, yellow_duration, num_states, num_actions):
+    def __init__(self, Model, Memory, TrafficGen, sumo_cmd, gamma, max_steps, green_duration, yellow_duration, num_states, num_actions, training_epochs):
         self._Model = Model
+        self._Memory = Memory
         self._TrafficGen = TrafficGen
+        self._gamma = gamma
         self._step = 0
         self._sumo_cmd = sumo_cmd
         self._max_steps = max_steps
@@ -26,13 +28,15 @@ class Simulation:
         self._yellow_duration = yellow_duration
         self._num_states = num_states
         self._num_actions = num_actions
-        self._reward_episode = []
-        self._queue_length_episode = []
+        self._reward_store = []
+        self._cumulative_wait_store = []
+        self._avg_queue_length_store = []
+        self._training_epochs = training_epochs
 
 
-    def run(self, episode):
+    def run(self, episode, epsilon):
         """
-        Runs the testing simulation
+        Runs an episode of simulation, then starts a training session
         """
         start_time = timeit.default_timer()
 
@@ -44,8 +48,12 @@ class Simulation:
         # inits
         self._step = 0
         self._waiting_times = {}
+        self._sum_neg_reward = 0
+        self._sum_queue_length = 0
+        self._sum_waiting_time = 0
         old_total_wait = 0
-        old_action = -1 # dummy init
+        old_state = -1
+        old_action = -1
 
         while self._step < self._max_steps:
 
@@ -57,8 +65,12 @@ class Simulation:
             current_total_wait = self._collect_waiting_times()
             reward = old_total_wait - current_total_wait
 
+            # saving the data into the memory
+            if self._step != 0:
+                self._Memory.add_sample((old_state, old_action, reward, current_state))
+
             # choose the light phase to activate, based on the current state of the intersection
-            action = self._choose_action(current_state)
+            action = self._choose_action(current_state, epsilon)
 
             # if the chosen phase is different from the last phase, activate the yellow phase
             if self._step != 0 and old_action != action:
@@ -70,21 +82,31 @@ class Simulation:
             self._simulate(self._green_duration)
 
             # saving variables for later & accumulate reward
+            old_state = current_state
             old_action = action
             old_total_wait = current_total_wait
 
-            self._reward_episode.append(reward)
+            # saving only the meaningful reward to better see if the agent is behaving correctly
+            if reward < 0:
+                self._sum_neg_reward += reward
 
-        #print("Total reward:", np.sum(self._reward_episode))
+        self._save_episode_stats()
+        print("Total reward:", self._sum_neg_reward, "- Epsilon:", round(epsilon, 2))
         traci.close()
         simulation_time = round(timeit.default_timer() - start_time, 1)
 
-        return simulation_time
+        print("Training...")
+        start_time = timeit.default_timer()
+        for _ in range(self._training_epochs):
+            self._replay()
+        training_time = round(timeit.default_timer() - start_time, 1)
+
+        return simulation_time, training_time
 
 
     def _simulate(self, steps_todo):
         """
-        Proceed with the simulation in sumo
+        Execute steps in sumo while gathering statistics
         """
         if (self._step + steps_todo) >= self._max_steps:  # do not do more steps than the maximum allowed number of steps
             steps_todo = self._max_steps - self._step
@@ -94,7 +116,8 @@ class Simulation:
             self._step += 1 # update the step counter
             steps_todo -= 1
             queue_length = self._get_queue_length()
-            self._queue_length_episode.append(queue_length)
+            self._sum_queue_length += queue_length
+            self._sum_waiting_time += queue_length # 1 step while wating in queue means 1 second waited, for each car, therefore queue_lenght == waited_seconds
 
 
     def _collect_waiting_times(self):
@@ -115,11 +138,14 @@ class Simulation:
         return total_waiting_time
 
 
-    def _choose_action(self, state):
+    def _choose_action(self, state, epsilon):
         """
-        Pick the best action known based on the current state of the env
+        Decide wheter to perform an explorative or exploitative action, according to an epsilon-greedy policy
         """
-        return np.argmax(self._Model.predict_one(state))
+        if random.random() < epsilon:
+            return random.randint(0, self._num_actions - 1) # random action
+        else:
+            return np.argmax(self._Model.predict_one(state)) # the best action given the current state
 
 
     def _set_yellow_phase(self, old_action):
@@ -134,8 +160,6 @@ class Simulation:
         """
         Activate the correct green light combination in sumo
         """
-
-
         if action_number == 0:
             traci.trafficlight.setPhase("TL", PHASE_NS_GREEN)
         elif action_number == 1:
@@ -228,14 +252,54 @@ class Simulation:
         return state
 
 
-    @property
-    def queue_length_episode(self):
-        return self._queue_length_episode
+    def _replay(self):
+        """
+        Retrieve a group of samples from the memory and for each of them update the learning equation, then train
+        """
+        batch = self._Memory.get_samples(self._Model.batch_size)
+
+        if len(batch) > 0:  # if the memory is full enough
+            states = np.array([val[0] for val in batch])  # extract states from the batch
+            next_states = np.array([val[3] for val in batch])  # extract next states from the batch
+
+            # prediction
+            q_s_a = self._Model.predict_batch(states)  # predict Q(state), for every sample
+            q_s_a_d = self._Model.predict_batch(next_states)  # predict Q(next_state), for every sample
+
+            # setup training arrays
+            x = np.zeros((len(batch), self._num_states))
+            y = np.zeros((len(batch), self._num_actions))
+
+            for i, b in enumerate(batch):
+                state, action, reward, _ = b[0], b[1], b[2], b[3]  # extract data from one sample
+                current_q = q_s_a[i]  # get the Q(state) predicted before
+                current_q[action] = reward + self._gamma * np.amax(q_s_a_d[i])  # update Q(state, action)
+                x[i] = state
+                y[i] = current_q  # Q(state) that includes the updated action value
+
+            self._Model.train_batch(x, y)  # train the NN
+
+
+    def _save_episode_stats(self):
+        """
+        Save the stats of the episode to plot the graphs at the end of the session
+        """
+        self._reward_store.append(self._sum_neg_reward)  # how much negative reward in this episode
+        self._cumulative_wait_store.append(self._sum_waiting_time)  # total number of seconds waited by cars in this episode
+        self._avg_queue_length_store.append(self._sum_queue_length / self._max_steps)  # average number of queued cars per step, in this episode
 
 
     @property
-    def reward_episode(self):
-        return self._reward_episode
+    def reward_store(self):
+        return self._reward_store
 
 
+    @property
+    def cumulative_wait_store(self):
+        return self._cumulative_wait_store
+
+
+    @property
+    def avg_queue_length_store(self):
+        return self._avg_queue_length_store
 

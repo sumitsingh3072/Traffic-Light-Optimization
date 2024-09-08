@@ -1,0 +1,6 @@
+numpy
+pandas
+matplotlib==3.9.2
+seaborn
+Xgboost
+tensorflow
